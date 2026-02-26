@@ -1,23 +1,8 @@
 # masawada 3D automatic choreography
 
-masawadaの3DモデルをAIが自動で踊らせるスクリーンセーバーです。
-
 https://hitode909.github.io/20260226-masawada-3d-automatic-choreography/
 
-## これは何
-
-[masawada/masawada-3d](https://github.com/masawada/masawada-3d) をベースに、自動振り付けシステムを追加したものです。
-
-- ダンスエンジン（5スタイル：flow / bounce / robot / chaos / minimal）
-- カメラシステム（18種のMVショット、自動切り替え）
-- プロシージャルステージ（11種の世界、15秒ごとに自動切り替え）
-- 音楽反応（マイク入力、またはシミュレートされたビート）
-- 最大3人のダンサー
-- フィルムグレイン・グリッチエフェクト
-
-## 操作
-
-- `F` キー：フルスクリーン切り替え
+[masawada/masawada-3d](https://github.com/masawada/masawada-3d) をベースに改変したものです。
 
 ## このリポジトリに含まれるファイルについて
 
