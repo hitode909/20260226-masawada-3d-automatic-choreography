@@ -103,6 +103,8 @@ class CameraSystem {
     this.choreoFocusTimer = 0;
     this.choreoFocusDur = 0;
     this.worldCycleCount = 0;
+    // Focus height offset: randomized per shot to avoid always targeting waist
+    this.focusY = 0;
 
     this.shots = [
       // 0: Front push-in
@@ -190,9 +192,20 @@ class CameraSystem {
     const next = this.shots[this.currentShot];
     this.shotTime = 0;
     this.transTime = 0;
-    this.transDur = next.cut ? 0 : (0.6 + Math.random() * 0.8);
+    this.transDur = next.cut ? 0 : (0.4 + Math.random() * 1.0);
+    this.shotDurMult = 0.85 + Math.random() * 0.3; // 0.85-1.15x duration jitter
     this.shotName = next.name;
     this.focusDancer = Math.random() > 0.5 ? 0 : 1;
+    // Randomize focus height: face(+0.4), chest(+0.2), default(0), legs(-0.3)
+    const closeShots = new Set([2,3,4,7,10,15,16]);
+    const mediumShots = new Set([0,1,13,17]);
+    if (closeShots.has(picked)) {
+      this.focusY = [0.4, 0.4, 0.2, 0.2, 0, -0.15][Math.floor(Math.random() * 6)];
+    } else if (mediumShots.has(picked)) {
+      this.focusY = [0.2, 0.1, 0, 0][Math.floor(Math.random() * 4)];
+    } else {
+      this.focusY = 0;
+    }
   }
 
   // MV #5: Called on each world switch
@@ -266,9 +279,9 @@ class CameraSystem {
     // MV #1: Editing mode controls cut rate
     const durMult = { largo: 2.2, andante: 1.0, allegro: 0.55, presto: 0.28 }[this.editingMode] ?? 1.0;
     const beatSwitchThresh = { largo: 1.1, andante: 0.55, allegro: 0.35, presto: 0.15 }[this.editingMode] ?? 0.55;
-    if (this.shotTime >= shot.dur * durMult) {
+    if (this.shotTime >= shot.dur * durMult * (this.shotDurMult || 1)) {
       this.switchShot();
-    } else if (audio.beatDetected && this.shotTime > 1.0 && !this.choreoFocusMode && Math.random() > beatSwitchThresh) {
+    } else if (audio.beatDetected && this.shotTime > 0.8 + Math.random() * 0.4 && !this.choreoFocusMode && Math.random() > beatSwitchThresh) {
       this.switchShot();
     }
 
@@ -289,9 +302,9 @@ class CameraSystem {
       roll = target.roll; fov = target.fov;
     }
 
-    // Offset by dancer position
+    // Offset by dancer position + focus height variation
     pos[0] += fx; pos[2] += fz;
-    tgt[0] += fx; tgt[2] += fz;
+    tgt[0] += fx; tgt[1] += this.focusY; tgt[2] += fz;
 
     this.applyCamera(pos, tgt, roll, fov);
 
@@ -313,13 +326,18 @@ class DanceEngine {
     this.styleBlend = 1; this.lastStyleChange = 0;
     this.styleNames = ['flow','bounce','robot','chaos','minimal'];
     this.accentStrength = 0;
+    this.styleInterval = 8 + Math.random() * 6; // 8-14s (varied per dancer)
+    this.styleBeatMin = 4 + Math.random() * 3; // 4-7s before beat-triggered change
     this.smoothed = {}; // temporal smoothing buffers per bone
     this.rootScene = null;
     this.stageX = startX || 0; this.stageZ = 0; // world position on stage
     this.timeOffset = timeOffset || 0;
     this.seedOffset = timeOffset > 0 ? 500 : 0;
+    this.moveSpeedMult = 0.85 + Math.random() * 0.3; // per-dancer movement speed variation
+    this.moveRangeMult = 0.85 + Math.random() * 0.3; // per-dancer movement range variation
     this.scaleTarget = 0; this.currentScale = 0; // for appear/disappear animation
     this.snapPose = null; this.snapTimer = 0;
+    this.freezeTimer = 0; // full body freeze (キメ止め)
     this.formationOverride = null; // {targetX, targetZ, pose, blend}
   }
 
@@ -352,11 +370,13 @@ class DanceEngine {
     if (audio.beatDetected) this.accentStrength = Math.min(this.accentStrength + 0.5, 1.0);
     this.accentStrength *= (1 - dt * 4); // smooth decay
     if (this.accentStrength < 0.01) this.accentStrength = 0;
+    // Freeze timer countdown (キメ止め)
+    if (this.freezeTimer > 0) this.freezeTimer -= dt;
 
     // Style transition (use real time for timing, not offset)
     if (this.styleBlend < 1) { this.styleBlend = Math.min(1, this.styleBlend + dt/2.5); if (this.styleBlend >= 1) this.currentStyle = this.nextStyle; }
-    if (this.time - this.lastStyleChange > 10) this.changeStyle();
-    if (audio.beatDetected && this.time - this.lastStyleChange > 5 && Math.random() > 0.9) this.changeStyle();
+    if (this.time - this.lastStyleChange > this.styleInterval) { this.changeStyle(); this.styleInterval = 8 + Math.random() * 6; }
+    if (audio.beatDetected && this.time - this.lastStyleChange > this.styleBeatMin && Math.random() > 0.88 + Math.random() * 0.08) this.changeStyle();
 
     // Rest pose (arms lowered from T-pose)
     for (const [name, bone] of Object.entries(this.bones)) {
@@ -440,8 +460,8 @@ class DanceEngine {
       const isSnapBone = this.snapTimer > 0 && this.snapPose && (boneName in this.snapPose);
       const rate = isSnapBone ? Math.min(1, dt * 40) : smoothRate;
 
-      // Freeze: hold current pose (battle/relay waiting dancers)
-      if (!(this.formationOverride && this.formationOverride.freeze)) {
+      // Freeze: hold current pose (battle/relay waiting dancers, or キメ freeze)
+      if (!(this.formationOverride && this.formationOverride.freeze) && this.freezeTimer <= 0) {
         s.x = lerp(s.x, tx, rate);
         s.y = lerp(s.y, ty, rate);
         s.z = lerp(s.z, tz, rate);
@@ -464,8 +484,8 @@ class DanceEngine {
       // Wander across floor
       const moveSpeeds = { flow: 0.25, bounce: 0.35, robot: 0.3, chaos: 0.5, minimal: 0.12 };
       const moveRanges = { flow: 2.0, bounce: 1.5, robot: 1.2, chaos: 2.5, minimal: 0.8 };
-      const mSpd = moveSpeeds[this.currentStyle] || 0.25;
-      const mRng = moveRanges[this.currentStyle] || 1.5;
+      const mSpd = (moveSpeeds[this.currentStyle] || 0.25) * this.moveSpeedMult;
+      const mRng = (moveRanges[this.currentStyle] || 1.5) * this.moveRangeMult;
       const targetStageX = organic(t * mSpd, 200 + this.seedOffset) * mRng;
       const targetStageZ = organic(t * mSpd * 0.7, 201 + this.seedOffset) * mRng * 0.6;
       this.stageX = lerp(this.stageX, targetStageX, Math.min(1, dt * 1.5));
@@ -522,6 +542,16 @@ class DanceEngine {
     ];
     this.snapPose = poses[Math.floor(Math.random() * poses.length)];
     this.snapTimer = 0.08 + Math.random() * 0.32;
+    // ~30% chance: extended snap hold → snap into pose then freeze
+    if (Math.random() < 0.3) {
+      this.snapTimer = 0.3 + Math.random() * 0.5;
+      this.freezeTimer = this.snapTimer + 0.3 + Math.random() * 0.7;
+    }
+  }
+
+  triggerFreeze() {
+    if (this.freezeTimer > 0.1) return;
+    this.freezeTimer = 0.4 + Math.random() * 0.8;
   }
 
   getStyle(name, t, au) {
@@ -708,8 +738,8 @@ class FormationSystem {
     this.formationDef = null;
     this.timer = 0;
     this.totalDuration = 0;
-    this.gatherDuration = 1.2;
-    this.releaseDuration = 0.8;
+    this.gatherDuration = 0.8 + Math.random() * 0.8; // 0.8-1.6s
+    this.releaseDuration = 0.5 + Math.random() * 0.6; // 0.5-1.1s
     this.cooldown = 0;
     this.syncTime = 0;
     this.loopPeriod = 0;
@@ -725,7 +755,7 @@ class FormationSystem {
   tryTrigger(dancers, audio) {
     if (this.cooldown > 0 || this.active) return;
     if (dancers.length < 2 || !audio.beatDetected) return;
-    if (Math.random() > 0.12) return;
+    if (Math.random() > 0.08 + Math.random() * 0.08) return; // 8-16% trigger
     this.start(dancers);
   }
 
@@ -751,6 +781,10 @@ class FormationSystem {
       this.dancerSlots = dancers.map((d, i) => ({
         dancer: d, targetX: positions[i].x, targetZ: positions[i].z,
         mirror: mirrors[i] || false, phaseOffset: offsets[i] || 0,
+        // Per-dancer ゆらぎ: amplitude variation, timing jitter, noise seed
+        ampScale: 0.88 + Math.random() * 0.24,  // 0.88-1.12 amplitude
+        timeJitter: (Math.random() - 0.5) * 0.06, // ±0.03s timing offset
+        noiseSeed: Math.floor(Math.random() * 1000),
       }));
     } else {
       // Relay / Battle: turn-based
@@ -767,6 +801,9 @@ class FormationSystem {
       this.dancerSlots = dancers.map((d, i) => ({
         dancer: d, targetX: positions[i].x, targetZ: positions[i].z,
         mirror: false, phaseOffset: 0,
+        ampScale: 0.88 + Math.random() * 0.24,
+        timeJitter: (Math.random() - 0.5) * 0.06,
+        noiseSeed: Math.floor(Math.random() * 1000),
       }));
     }
     this.dancerSlots.forEach(s => {
@@ -779,7 +816,7 @@ class FormationSystem {
     this.dancerSlots = [];
     this.active = false;
     this.phase = 'idle';
-    this.cooldown = 5;
+    this.cooldown = 3 + Math.random() * 5;
   }
 
   update(dt, audio, overlay, camSys) {
@@ -808,11 +845,20 @@ class FormationSystem {
       this.syncTime += dt;
 
       if (this.mode === 'formation') {
-        // All dancers move together
+        // All dancers move together (with per-dancer ゆらぎ for human feel)
         this.dancerSlots.forEach(s => {
           const offset = s.phaseOffset * this.loopPeriod;
-          const loopPhase = ((this.syncTime + offset) % this.loopPeriod) / this.loopPeriod;
+          const jitteredTime = this.syncTime + offset + s.timeJitter;
+          const loopPhase = ((jitteredTime % this.loopPeriod) + this.loopPeriod) % this.loopPeriod / this.loopPeriod;
           const pose = this._getPose(loopPhase, audio, s.mirror);
+          // Apply amplitude variation + micro-noise per dancer
+          const t = this.syncTime;
+          for (const bn of Object.keys(pose)) {
+            if (pose[bn].x) pose[bn].x = pose[bn].x * s.ampScale + organic(t * 1.2, s.noiseSeed) * 0.03;
+            if (pose[bn].y) pose[bn].y = pose[bn].y * s.ampScale + organic(t * 1.1, s.noiseSeed + 1) * 0.02;
+            if (pose[bn].z) pose[bn].z = pose[bn].z * s.ampScale + organic(t * 0.9, s.noiseSeed + 2) * 0.02;
+            if (pose[bn].posY) pose[bn].posY *= s.ampScale;
+          }
           s.dancer.formationOverride = { targetX: s.targetX, targetZ: s.targetZ, pose, blend: 1 };
         });
       } else {
@@ -837,8 +883,10 @@ class FormationSystem {
               s.dancer.formationOverride = { targetX: s.targetX, targetZ: s.targetZ, pose: null, blend: 0 };
             }
           } else {
-            // Waiting: freeze in current pose
-            s.dancer.formationOverride = { targetX: s.targetX, targetZ: s.targetZ, freeze: true };
+            // Waiting: subtle supporting motion (contemporary dance framing)
+            const wt = this.syncTime + i * 50; // per-dancer phase
+            const pose = this._supportPose(wt, s, this.dancerSlots[this.currentSoloist]);
+            s.dancer.formationOverride = { targetX: s.targetX, targetZ: s.targetZ, pose, blend: 0.7 };
           }
         });
       }
@@ -935,6 +983,107 @@ class FormationSystem {
       };
     }
     return result;
+  }
+
+  // Contemporary dance "support" pose: subtle motion while watching the soloist
+  _supportPose(t, waitSlot, soloSlot) {
+    const breathe = Math.sin(t * 0.7) * 0.06; // slow breathing
+    const sway = Math.sin(t * 0.35) * 0.04; // gentle weight shift
+    const nod = Math.sin(t * 0.5) * 0.03 + Math.sin(t * 0.8) * 0.02;
+    // Slight lean toward soloist
+    const dx = soloSlot.targetX - waitSlot.targetX;
+    const leanDir = dx > 0 ? 1 : -1;
+    const lean = leanDir * 0.05 + Math.sin(t * 0.4) * 0.03;
+    // Subtle head turn toward soloist
+    const gazeY = Math.atan2(-dx, soloSlot.targetZ - waitSlot.targetZ);
+    const headY = Math.max(-0.6, Math.min(0.6, gazeY)) * 0.5;
+    return {
+      Hips: { x: breathe * 0.5, z: sway, posY: Math.sin(t * 0.6) * 0.01 },
+      Spine: { x: breathe, z: lean * 0.5 },
+      Chest: { x: breathe * 0.3 },
+      UpperChest: { z: lean * 0.3 },
+      Neck: { x: nod * 0.6, y: headY * 0.6 },
+      Head: { x: nod * 0.4, y: headY * 0.4 },
+      LeftUpperArm: { x: 0.08 + Math.sin(t * 0.3) * 0.04, z: -0.05 + Math.sin(t * 0.25) * 0.03 },
+      RightUpperArm: { x: 0.08 + Math.sin(t * 0.3 + 1) * 0.04, z: 0.05 - Math.sin(t * 0.25 + 1) * 0.03 },
+    };
+  }
+}
+
+// ============================================================
+// GAZE SYSTEM — occasional eye contact & richer neck movement
+// ============================================================
+class GazeSystem {
+  constructor() {
+    this.gazes = new Map(); // dancer object → gaze state
+  }
+
+  tryTrigger(activeDancers, audio, formationActive) {
+    if (!audio.beatDetected || activeDancers.length < 2) return;
+    for (const dancer of activeDancers) {
+      if (dancer.scaleTarget < 0.5) continue;
+      const state = this.gazes.get(dancer);
+      if (state && (state.active || state.cooldown > 0)) continue;
+      // 8% chance per beat (lower during formation to avoid clutter)
+      if (Math.random() > (formationActive ? 0.04 : 0.08)) continue;
+      // Pick a random other dancer
+      const others = activeDancers.filter(d => d !== dancer && d.scaleTarget > 0.5);
+      if (others.length === 0) continue;
+      const target = others[Math.floor(Math.random() * others.length)];
+      const gs = { active: true, target, timer: 0, duration: 2 + Math.random() * 3, cooldown: 0, blend: 0 };
+      this.gazes.set(dancer, gs);
+      // ~40% mutual gaze
+      if (Math.random() < 0.4) {
+        const os = this.gazes.get(target);
+        if (!os || (!os.active && os.cooldown <= 0)) {
+          this.gazes.set(target, { active: true, target: dancer, timer: 0, duration: 1.5 + Math.random() * 2.5, cooldown: 0, blend: 0 });
+        }
+      }
+    }
+  }
+
+  update(dt, activeDancers) {
+    for (const [dancer, state] of this.gazes) {
+      if (!state.active) { state.cooldown = Math.max(0, state.cooldown - dt); continue; }
+      state.timer += dt;
+      // Blend in/out
+      const bIn = 0.6, bOut = 0.8;
+      if (state.timer < bIn) state.blend = smoothstep(0, 1, state.timer / bIn);
+      else if (state.timer > state.duration - bOut) state.blend = smoothstep(1, 0, (state.timer - (state.duration - bOut)) / bOut);
+      else state.blend = 1;
+      // End
+      if (state.timer >= state.duration) {
+        state.active = false; state.cooldown = 5 + Math.random() * 10; state.blend = 0; continue;
+      }
+      // Validate
+      const tgt = state.target;
+      if (!dancer.bones.Head || !dancer.bones.Neck || dancer.scaleTarget < 0.5 || tgt.scaleTarget < 0.5) {
+        state.active = false; state.cooldown = 2; continue;
+      }
+      // Direction from dancer to target (model faces +Z after Hips π rotation)
+      const dx = tgt.stageX - dancer.stageX, dz = tgt.stageZ - dancer.stageZ;
+      const dist = Math.sqrt(dx * dx + dz * dz);
+      if (dist < 0.01) continue;
+      // Yaw in model-local frame (Hips rotated π)
+      let yaw = Math.atan2(-dx, dz);
+      yaw = Math.max(-1.22, Math.min(1.22, yaw)); // clamp ±70°
+      // Subtle pitch variation during gaze
+      const gt = state.timer;
+      const pitch = Math.sin(gt * 0.8) * 0.08 + Math.sin(gt * 1.3) * 0.05;
+      const bl = state.blend;
+      // Split: Neck 60%, Head 40%
+      dancer.bones.Neck.rotation.y += yaw * 0.6 * bl;
+      dancer.bones.Neck.rotation.x += pitch * 0.6 * bl;
+      dancer.bones.Head.rotation.y += yaw * 0.4 * bl;
+      dancer.bones.Head.rotation.x += pitch * 0.4 * bl;
+    }
+    // Enrich neck up/down for ALL active dancers
+    for (const d of activeDancers) {
+      if (!d.bones.Neck || !d.bones.Head || d.scaleTarget < 0.5) continue;
+      const t = d.time + d.timeOffset;
+      d.bones.Neck.rotation.x += organic(t * 0.6, 300 + (d.seedOffset || 0)) * 0.12;
+      d.bones.Head.rotation.x += organic(t * 0.45, 301 + (d.seedOffset || 0)) * 0.08;
+    }
   }
 }
 
@@ -1728,6 +1877,7 @@ scene.add(grid);
 // World generator
 const worldGen = new WorldGenerator(scene);
 let worldSwitchTimer = 0;
+let worldSwitchMax = 12 + Math.random() * 8; // 12-20s varied per cycle
 let currentWorldIdx = 0;
 worldGen.build(WORLD_TYPES[0]); // initial world
 
@@ -1842,6 +1992,7 @@ const audio = new AudioSystem();
 const camSys = new CameraSystem(camera);
 const overlay = new OverlaySystem();
 const formationSys = new FormationSystem();
+const gazeSys = new GazeSystem();
 const POOL_SIZE = 3;
 const dancerPool = Array.from({length: POOL_SIZE}, (_, i) => new DanceEngine(i * 100, 0));
 let activeDancers = [];
@@ -1875,9 +2026,12 @@ function switchWorld(time) {
   if (formationSys.active) formationSys.forceEnd();
   currentWorldIdx = Math.floor(Math.random() * WORLD_TYPES.length);
   worldGen.build(WORLD_TYPES[currentWorldIdx]);
-  const counts = [1, 2, 2, 2, 3];
-  setActiveDancers(counts[Math.floor(Math.random() * counts.length)]);
-  activeDancers.forEach(d => { if (Math.random() > 0.5) d.changeStyle(); });
+  const counts = [1, 1, 2, 2, 2, 2, 3, 3];
+  let newCount = counts[Math.floor(Math.random() * counts.length)];
+  // Prefer change from current count
+  if (newCount === activeDancers.length && Math.random() > 0.3) newCount = newCount === 3 ? 2 : newCount + 1;
+  setActiveDancers(newCount);
+  activeDancers.forEach(d => { if (Math.random() > 0.4 + Math.random() * 0.2) d.changeStyle(); });
   overlay.triggerWorldSwitch(WORLD_TYPES[currentWorldIdx]);
   // MV #3: Snap to world-appropriate palette
   prevPalette = currentPalette;
@@ -2113,8 +2267,15 @@ function animate() {
   if (audio.beatDetected && activeDancers.length > 0 && Math.random() > 0.75 && !formationSys.active) {
     activeDancers[Math.floor(Math.random() * activeDancers.length)].triggerSnap();
   }
+  // Full body freeze: ~8% chance per beat (全身ピタッと止まる)
+  if (audio.beatDetected && activeDancers.length > 0 && Math.random() < 0.08 && !formationSys.active) {
+    const d = activeDancers[Math.floor(Math.random() * activeDancers.length)];
+    d.triggerFreeze();
+  }
   dancerPool.forEach(d => d.update(dt, audio));
   formationSys.update(dt, audio, overlay, camSys);
+  gazeSys.tryTrigger(activeDancers, audio, formationSys.active);
+  gazeSys.update(dt, activeDancers);
 
   // Collision avoidance (skip during formation — positions are fixed)
   const visibleDancers = activeDancers.filter(d => d.scaleTarget > 0.5 && d.rootScene);
@@ -2137,10 +2298,11 @@ function animate() {
 
   // World switch timer
   worldSwitchTimer += dt;
-  if (worldSwitchTimer > 15 || (audio.beatDetected && worldSwitchTimer > 8 && Math.random() > 0.97)) {
+  if (worldSwitchTimer > worldSwitchMax || (audio.beatDetected && worldSwitchTimer > 6 + Math.random() * 4 && Math.random() > 0.96)) {
     worldSwitchTimer = 0;
+    worldSwitchMax = 12 + Math.random() * 8;
     switchWorld(time);
-    strobeFlash = 2.5; // big flash on world switch
+    strobeFlash = 2.0 + Math.random() * 1.0; // varied flash on world switch
   }
 
   worldGen.update(time);
