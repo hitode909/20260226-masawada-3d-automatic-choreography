@@ -80,6 +80,30 @@ class CameraSystem {
     this.focusDancer = 0;
     this.wideShots = new Set([6, 8, 9, 12]); // ORBIT, WIDE, PULL BACK, SPIN RISE
 
+    // MV #1: Editing rhythm (largo/andante/allegro/presto)
+    this.editingMode = 'andante';
+    this.editingModeTimer = 0;
+    this.editingModeDur = 25 + Math.random() * 20;
+    // MV #2: Camera role (observer=dynamic / presenter=deliberate)
+    this.cameraRole = 'observer';
+    this.cameraRoleTimer = 0;
+    this.cameraRoleDur = 22 + Math.random() * 15;
+    // MV #4: Shot sequencing (establish→medium→close→breathe)
+    this.shotPhase = 'establish';
+    this.shotPhaseCount = 0;
+    this.shotPhaseMax = 4;
+    this.shotCategories = {
+      establish: [6, 8, 9, 12],
+      medium:    [0, 1, 9, 17, 13],
+      close:     [2, 3, 4, 7, 10, 15, 16],
+      breathe:   [5, 11, 14],
+    };
+    // MV #5: Choreography focus mode (locked wide, largo)
+    this.choreoFocusMode = false;
+    this.choreoFocusTimer = 0;
+    this.choreoFocusDur = 0;
+    this.worldCycleCount = 0;
+
     this.shots = [
       // 0: Front push-in
       { name:'PUSH IN', pos:p=>[0,1.2,lerp(5,2.5,p)], tgt:p=>[0,lerp(1,1.1,p),0], roll:0, fov:30, dur:4, cut:false, w:3 },
@@ -127,16 +151,41 @@ class CameraSystem {
   }
 
   switchShot() {
-    // Save current state
     const cur = this.shots[this.currentShot];
     const p = Math.min(1, this.shotTime / cur.dur);
     this.prevState = this.getShotState(cur, p);
 
-    // Pick next (weighted random, avoid repeat)
-    const ws = this.shots.map((s,i) => i === this.currentShot ? 0 : s.w);
+    // MV #4: Phase advancement (establish→medium→close→breathe cycle)
+    this.shotPhaseCount++;
+    if (this.shotPhaseCount >= this.shotPhaseMax) {
+      this.shotPhaseCount = 0;
+      this.shotPhaseMax = 3 + Math.floor(Math.random() * 3);
+      const seq = { establish:'medium', medium:'close', close:'breathe', breathe:'establish' };
+      this.shotPhase = seq[this.shotPhase] || 'medium';
+    }
+
+    // Phase-aware candidate selection
+    let candidates;
+    if (this.choreoFocusMode) {
+      // MV #5: Choreo focus → wide/orbit shots only
+      candidates = [6, 8, 9].filter(i => i !== this.currentShot);
+    } else {
+      const phaseShots = this.shotCategories[this.shotPhase] || [];
+      if (Math.random() < 0.72 && phaseShots.length > 0) {
+        candidates = phaseShots.filter(i => i !== this.currentShot);
+        if (candidates.length === 0) candidates = phaseShots;
+      } else {
+        candidates = this.shots.map((_,i) => i).filter(i => i !== this.currentShot);
+      }
+    }
+
+    // Weighted pick from candidates
+    const ws = candidates.map(i => this.shots[i].w);
     const total = ws.reduce((a,b) => a+b, 0);
     let r = Math.random() * total;
-    for (let i = 0; i < ws.length; i++) { r -= ws[i]; if (r <= 0) { this.currentShot = i; break; } }
+    let picked = candidates[candidates.length - 1];
+    for (let k = 0; k < candidates.length; k++) { r -= ws[k]; if (r <= 0) { picked = candidates[k]; break; } }
+    this.currentShot = picked;
 
     const next = this.shots[this.currentShot];
     this.shotTime = 0;
@@ -144,6 +193,26 @@ class CameraSystem {
     this.transDur = next.cut ? 0 : (0.6 + Math.random() * 0.8);
     this.shotName = next.name;
     this.focusDancer = Math.random() > 0.5 ? 0 : 1;
+  }
+
+  // MV #5: Called on each world switch
+  onWorldSwitch() {
+    this.worldCycleCount++;
+    this.shotPhase = 'establish';
+    this.shotPhaseCount = 0;
+    if (!this.choreoFocusMode && this.worldCycleCount % 3 === 0) {
+      // Every 3rd world: enter choreography focus mode (long wide shot)
+      this.choreoFocusMode = true;
+      this.choreoFocusDur = 15 + Math.random() * 8;
+      this.choreoFocusTimer = 0;
+      this.editingMode = 'largo';
+    } else if (!this.choreoFocusMode) {
+      // Random editing mode on world switch
+      const modes = ['largo', 'andante', 'andante', 'allegro', 'presto'];
+      this.editingMode = modes[Math.floor(Math.random() * modes.length)];
+      this.editingModeTimer = 0;
+      this.editingModeDur = 20 + Math.random() * 20;
+    }
   }
 
   applyCamera(pos, tgt, roll, fov) {
@@ -156,6 +225,31 @@ class CameraSystem {
 
   update(time, dt, audio, dancers) {
     if (!this.autoSwitch) return;
+
+    // MV #1: Editing mode timer
+    this.editingModeTimer += dt;
+    if (this.editingModeTimer > this.editingModeDur && !this.choreoFocusMode) {
+      this.editingModeTimer = 0;
+      this.editingModeDur = 22 + Math.random() * 20;
+      const modes = ['largo', 'andante', 'andante', 'allegro', 'presto'];
+      this.editingMode = modes[Math.floor(Math.random() * modes.length)];
+    }
+    // MV #2: Camera role timer
+    this.cameraRoleTimer += dt;
+    if (this.cameraRoleTimer > this.cameraRoleDur) {
+      this.cameraRoleTimer = 0;
+      this.cameraRoleDur = 22 + Math.random() * 15;
+      this.cameraRole = this.cameraRole === 'observer' ? 'presenter' : 'observer';
+    }
+    // MV #5: Choreo focus exit
+    if (this.choreoFocusMode) {
+      this.choreoFocusTimer += dt;
+      if (this.choreoFocusTimer >= this.choreoFocusDur) {
+        this.choreoFocusMode = false;
+        this.editingMode = 'andante';
+      }
+    }
+
     // Wide shots frame both dancers; close shots focus one
     let fx, fz;
     if (this.wideShots.has(this.currentShot) && dancers.length > 1) {
@@ -169,10 +263,12 @@ class CameraSystem {
     this.shotTime += dt;
     const shot = this.shots[this.currentShot];
 
-    // Switch conditions
-    if (this.shotTime >= shot.dur) {
+    // MV #1: Editing mode controls cut rate
+    const durMult = { largo: 2.2, andante: 1.0, allegro: 0.55, presto: 0.28 }[this.editingMode] ?? 1.0;
+    const beatSwitchThresh = { largo: 1.1, andante: 0.55, allegro: 0.35, presto: 0.15 }[this.editingMode] ?? 0.55;
+    if (this.shotTime >= shot.dur * durMult) {
       this.switchShot();
-    } else if (audio.beatDetected && this.shotTime > 1.2 && Math.random() > 0.55) {
+    } else if (audio.beatDetected && this.shotTime > 1.0 && !this.choreoFocusMode && Math.random() > beatSwitchThresh) {
       this.switchShot();
     }
 
@@ -199,8 +295,9 @@ class CameraSystem {
 
     this.applyCamera(pos, tgt, roll, fov);
 
-    // Handheld shake (subtle, audio-reactive)
-    const sh = 0.003 + audio.overall * 0.006;
+    // MV #2: Handheld shake - observer is dynamic, presenter is deliberate
+    const shakeBase = this.cameraRole === 'presenter' ? 0.001 : 0.003;
+    const sh = shakeBase + audio.overall * 0.006;
     this.camera.position.x += Math.sin(time*17.3) * sh;
     this.camera.position.y += Math.sin(time*13.7) * sh;
   }
@@ -1210,15 +1307,26 @@ function setActiveDancers(count) {
   });
 }
 
-function switchWorld() {
+// MV #3: World-appropriate palette mapping (color story)
+const worldPaletteMap = {
+  crystal: 2, ruins: 0, neon: 3, organic: 4, tower: 3,
+  void: 2, sunset: 1, underwater: 2, aurora: 2, disco: 0, lava: 1,
+};
+
+function switchWorld(time) {
   currentWorldIdx = Math.floor(Math.random() * WORLD_TYPES.length);
   worldGen.build(WORLD_TYPES[currentWorldIdx]);
-  // Randomize dancer count (1-3, weighted toward 2)
   const counts = [1, 2, 2, 2, 3];
   setActiveDancers(counts[Math.floor(Math.random() * counts.length)]);
-  // Also randomize styles
   activeDancers.forEach(d => { if (Math.random() > 0.5) d.changeStyle(); });
   overlay.triggerWorldSwitch(WORLD_TYPES[currentWorldIdx]);
+  // MV #3: Snap to world-appropriate palette
+  prevPalette = currentPalette;
+  currentPalette = worldPaletteMap[WORLD_TYPES[currentWorldIdx]] ?? 0;
+  paletteBlend = 0;
+  lastPaletteChange = time;
+  // MV #2/#4/#5: camera on world switch
+  camSys.onWorldSwitch();
 }
 
 // ============================================================
@@ -1267,7 +1375,8 @@ function updateLights(time, au, dancers) {
   const fz = dancers.length > 1 ? (dancers[0].stageZ + dancers[1].stageZ) * 0.5 : dancers[0].stageZ;
   // Palette switching (on beat or every ~6s)
   if (paletteBlend < 1) paletteBlend = Math.min(1, paletteBlend + 0.02);
-  if ((au.beatDetected && time - lastPaletteChange > 4 && Math.random() > 0.5) || time - lastPaletteChange > 8) {
+  // MV #3: Slower palette changes — hold color story within world
+  if ((au.beatDetected && time - lastPaletteChange > 14 && Math.random() > 0.75) || time - lastPaletteChange > 22) {
     prevPalette = currentPalette;
     currentPalette = (currentPalette + 1 + Math.floor(Math.random() * (palettes.length - 1))) % palettes.length;
     paletteBlend = 0;
@@ -1467,7 +1576,7 @@ function animate() {
   worldSwitchTimer += dt;
   if (worldSwitchTimer > 15 || (audio.beatDetected && worldSwitchTimer > 8 && Math.random() > 0.97)) {
     worldSwitchTimer = 0;
-    switchWorld();
+    switchWorld(time);
     strobeFlash = 2.5; // big flash on world switch
   }
 
