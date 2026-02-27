@@ -320,6 +320,7 @@ class DanceEngine {
     this.seedOffset = timeOffset > 0 ? 500 : 0;
     this.scaleTarget = 0; this.currentScale = 0; // for appear/disappear animation
     this.snapPose = null; this.snapTimer = 0;
+    this.formationOverride = null; // {targetX, targetZ, pose, blend}
   }
 
   init(vrm) {
@@ -399,6 +400,19 @@ class DanceEngine {
     const accentMult = 1 + this.accentStrength * 0.35;
     const smoothRate = Math.min(1, dt * 8); // ~0.13 at 60fps → smooth interpolation
 
+    // Formation pose override (loop-based choreography from FormationSystem)
+    if (this.formationOverride && this.formationOverride.pose) {
+      const fPose = this.formationOverride.pose;
+      const fBlend = this.formationOverride.blend || 1;
+      for (const bn of Object.keys(fPose)) {
+        if (!blended[bn]) blended[bn] = {x:0, y:0, z:0, posY:0};
+        blended[bn].x = lerp(blended[bn].x, fPose[bn].x || 0, fBlend);
+        blended[bn].y = lerp(blended[bn].y, fPose[bn].y || 0, fBlend);
+        blended[bn].z = lerp(blended[bn].z, fPose[bn].z || 0, fBlend);
+        blended[bn].posY = lerp(blended[bn].posY, fPose[bn].posY || 0, fBlend);
+      }
+    }
+
     // Snap pose: override blended targets, snap-in fast
     if (this.snapTimer > 0) {
       this.snapTimer -= dt;
@@ -438,15 +452,22 @@ class DanceEngine {
       if (boneName === 'Hips') bone.position.y += s.posY;
     }
 
-    // Stage movement (wander across floor)
-    const moveSpeeds = { flow: 0.25, bounce: 0.35, robot: 0.3, chaos: 0.5, minimal: 0.12 };
-    const moveRanges = { flow: 2.0, bounce: 1.5, robot: 1.2, chaos: 2.5, minimal: 0.8 };
-    const mSpd = moveSpeeds[this.currentStyle] || 0.25;
-    const mRng = moveRanges[this.currentStyle] || 1.5;
-    const targetStageX = organic(t * mSpd, 200 + this.seedOffset) * mRng;
-    const targetStageZ = organic(t * mSpd * 0.7, 201 + this.seedOffset) * mRng * 0.6;
-    this.stageX = lerp(this.stageX, targetStageX, Math.min(1, dt * 1.5));
-    this.stageZ = lerp(this.stageZ, targetStageZ, Math.min(1, dt * 1.5));
+    // Stage movement
+    if (this.formationOverride) {
+      // Formation controls position
+      this.stageX = lerp(this.stageX, this.formationOverride.targetX, Math.min(1, dt * 3));
+      this.stageZ = lerp(this.stageZ, this.formationOverride.targetZ, Math.min(1, dt * 3));
+    } else {
+      // Wander across floor
+      const moveSpeeds = { flow: 0.25, bounce: 0.35, robot: 0.3, chaos: 0.5, minimal: 0.12 };
+      const moveRanges = { flow: 2.0, bounce: 1.5, robot: 1.2, chaos: 2.5, minimal: 0.8 };
+      const mSpd = moveSpeeds[this.currentStyle] || 0.25;
+      const mRng = moveRanges[this.currentStyle] || 1.5;
+      const targetStageX = organic(t * mSpd, 200 + this.seedOffset) * mRng;
+      const targetStageZ = organic(t * mSpd * 0.7, 201 + this.seedOffset) * mRng * 0.6;
+      this.stageX = lerp(this.stageX, targetStageX, Math.min(1, dt * 1.5));
+      this.stageZ = lerp(this.stageZ, targetStageZ, Math.min(1, dt * 1.5));
+    }
     if (this.rootScene) {
       this.rootScene.position.x = this.stageX;
       this.rootScene.position.z = this.stageZ;
@@ -650,6 +671,202 @@ class DanceEngine {
       LeftFoot: { x: organic(t*0.3,139)*0.03*I },
       RightFoot: { x: organic(t*0.3,140)*0.03*I },
     };
+  }
+}
+
+// ============================================================
+// FORMATION SYSTEM - Synchronized group choreography
+// ============================================================
+const BEAT_PERIOD = 1 / 2.2;
+const FORMATIONS = {
+  line:     { positions: { 2:[{x:-1.2,z:0},{x:1.2,z:0}], 3:[{x:-1.8,z:0},{x:0,z:0},{x:1.8,z:0}] },
+              mirror: [false,true], mirror3: [false,false,true], loopBeats: 4, choreo: 'sharp' },
+  vee:      { positions: { 2:[{x:-1.0,z:-0.8},{x:1.0,z:-0.8}], 3:[{x:0,z:0.6},{x:-1.3,z:-0.6},{x:1.3,z:-0.6}] },
+              mirror: [false,true], mirror3: [false,false,true], loopBeats: 8, choreo: 'wave' },
+  circle:   { positions: { 2:[{x:-1.2,z:0},{x:1.2,z:0}], 3:[{x:0,z:1.2},{x:-1.04,z:-0.6},{x:1.04,z:-0.6}] },
+              mirror: [false,false], mirror3: [false,false,false], loopBeats: 4, choreo: 'sharp' },
+  mirror:   { positions: { 2:[{x:-1.5,z:0},{x:1.5,z:0}], 3:[{x:0,z:0},{x:-1.8,z:0.3},{x:1.8,z:0.3}] },
+              mirror: [false,true], mirror3: [false,false,true], loopBeats: 4, choreo: 'sharp' },
+  diagonal: { positions: { 2:[{x:-1.0,z:0.6},{x:1.0,z:-0.6}], 3:[{x:-1.5,z:0.8},{x:0,z:0},{x:1.5,z:-0.8}] },
+              mirror: [false,false], mirror3: [false,false,false], loopBeats: 8, choreo: 'wave',
+              phaseOffsets3: [0, 0.33, 0.66] },
+};
+
+class FormationSystem {
+  constructor() {
+    this.active = false;
+    this.phase = 'idle';
+    this.formationDef = null;
+    this.timer = 0;
+    this.totalDuration = 0;
+    this.gatherDuration = 1.2;
+    this.releaseDuration = 0.8;
+    this.cooldown = 0;
+    this.syncTime = 0;
+    this.loopPeriod = 0;
+    this.dancerSlots = [];
+  }
+
+  tryTrigger(dancers, audio) {
+    if (this.cooldown > 0 || this.active) return;
+    if (dancers.length < 2 || !audio.beatDetected) return;
+    if (Math.random() > 0.12) return;
+    this.start(dancers);
+  }
+
+  start(dancers) {
+    this.active = true;
+    this.phase = 'gather';
+    this.timer = 0;
+    const keys = Object.keys(FORMATIONS);
+    this.formationDef = FORMATIONS[keys[Math.floor(Math.random() * keys.length)]];
+    const n = dancers.length;
+    const positions = this.formationDef.positions[n];
+    const mirrors = n === 3 ? (this.formationDef.mirror3 || []) : (this.formationDef.mirror || []);
+    const offsets = this.formationDef['phaseOffsets' + n] || new Array(n).fill(0);
+    this.loopPeriod = this.formationDef.loopBeats * BEAT_PERIOD;
+    this.totalDuration = (3 + Math.floor(Math.random() * 3)) * this.loopPeriod;
+    this.syncTime = 0;
+    this.dancerSlots = dancers.map((d, i) => ({
+      dancer: d, targetX: positions[i].x, targetZ: positions[i].z,
+      mirror: mirrors[i] || false, phaseOffset: offsets[i] || 0,
+    }));
+    this.dancerSlots.forEach(s => {
+      s.dancer.formationOverride = { targetX: s.targetX, targetZ: s.targetZ, pose: null, blend: 0 };
+    });
+  }
+
+  forceEnd() {
+    this.dancerSlots.forEach(s => { s.dancer.formationOverride = null; });
+    this.dancerSlots = [];
+    this.active = false;
+    this.phase = 'idle';
+    this.cooldown = 5;
+  }
+
+  update(dt, audio, overlay, camSys) {
+    if (this.cooldown > 0) this.cooldown -= dt;
+    if (!this.active) return;
+    this.timer += dt;
+
+    if (this.phase === 'gather') {
+      const blend = smoothstep(0, 1, Math.min(1, this.timer / this.gatherDuration));
+      this.dancerSlots.forEach(s => {
+        s.dancer.formationOverride = { targetX: s.targetX, targetZ: s.targetZ, pose: null, blend: 0 };
+      });
+      if (this.timer >= this.gatherDuration) {
+        this.phase = 'synced';
+        this.timer = 0;
+        this.syncTime = 0;
+        // Flash on sync start
+        overlay.triggerBeat(1.0);
+        // Camera: wide shot to show formation
+        camSys.choreoFocusMode = true;
+        camSys.choreoFocusDur = this.totalDuration + this.releaseDuration + 2;
+        camSys.choreoFocusTimer = 0;
+        camSys.editingMode = 'largo';
+      }
+    } else if (this.phase === 'synced') {
+      this.syncTime += dt;
+      this.dancerSlots.forEach(s => {
+        const offset = s.phaseOffset * this.loopPeriod;
+        const loopPhase = ((this.syncTime + offset) % this.loopPeriod) / this.loopPeriod;
+        const pose = this._getPose(loopPhase, audio, s.mirror);
+        s.dancer.formationOverride = { targetX: s.targetX, targetZ: s.targetZ, pose, blend: 1 };
+      });
+      if (this.timer >= this.totalDuration) { this.phase = 'release'; this.timer = 0; }
+    } else if (this.phase === 'release') {
+      const blend = 1 - smoothstep(0, 1, Math.min(1, this.timer / this.releaseDuration));
+      this.dancerSlots.forEach(s => {
+        if (blend > 0.01 && s.dancer.formationOverride) {
+          s.dancer.formationOverride.blend = blend;
+        } else {
+          s.dancer.formationOverride = null;
+        }
+      });
+      if (this.timer >= this.releaseDuration) {
+        this.dancerSlots.forEach(s => { s.dancer.formationOverride = null; });
+        this.dancerSlots = [];
+        this.active = false;
+        this.phase = 'idle';
+        this.cooldown = 8 + Math.random() * 10;
+      }
+    }
+  }
+
+  _getPose(phase, au, mirror) {
+    const choreo = this.formationDef.choreo;
+    const m = mirror ? -1 : 1;
+    const I = 0.8 + au.overall * 2.0;
+    const beats = this.formationDef.loopBeats;
+    const beatIdx = Math.floor(phase * beats);
+    const beatSub = (phase * beats) % 1;
+    const snap = smoothstep(0, 0.2, beatSub);
+    if (choreo === 'sharp') return this._sharpChoreo(beatIdx, snap, I, m, au);
+    if (choreo === 'wave') return this._waveChoreo(phase, beatIdx, snap, I, m, au);
+    return this._sharpChoreo(beatIdx, snap, I, m, au);
+  }
+
+  // Sharp unison: K-pop style, 4-beat loop
+  _sharpChoreo(beatIdx, snap, I, m, au) {
+    const poses = [
+      // 0: squat + arms forward punch
+      { Hips:{posY:-0.1*I}, Spine:{x:0.15*I},
+        LeftUpperArm:{x:-0.6*I,z:0.2}, RightUpperArm:{x:-0.6*I,z:-0.2},
+        LeftLowerArm:{z:0.3}, RightLowerArm:{z:-0.3},
+        LeftUpperLeg:{x:0.2*I}, RightUpperLeg:{x:0.2*I} },
+      // 1: stand + arms wide spread
+      { Hips:{posY:0,y:0.15*m*I}, Spine:{y:0.1*m*I},
+        LeftUpperArm:{x:0.1,z:1.4*I}, RightUpperArm:{x:0.1,z:-1.4*I},
+        LeftHand:{z:0.3*I}, RightHand:{z:-0.3*I} },
+      // 2: twist + one arm up
+      { Hips:{y:0.35*m*I,posY:-0.06*I}, Spine:{y:0.25*m*I}, UpperChest:{y:0.15*m*I},
+        LeftUpperArm:{x:m>0?-1.4*I:0.1,z:m>0?0.4:0.3}, RightUpperArm:{x:m<0?-1.4*I:0.1,z:m<0?-0.4:-0.3},
+        Head:{y:-0.3*m*I} },
+      // 3: snap back + jump
+      { Hips:{posY:0.04*I,x:-0.1*I}, Spine:{x:-0.15*I}, UpperChest:{x:-0.1*I},
+        LeftUpperArm:{x:-1.3*I,z:0.35}, RightUpperArm:{x:-1.3*I,z:-0.35},
+        LeftLowerArm:{z:0.2}, RightLowerArm:{z:-0.2} },
+    ];
+    const cur = poses[beatIdx % poses.length];
+    const nxt = poses[(beatIdx + 1) % poses.length];
+    return this._blendPoses(cur, nxt, snap);
+  }
+
+  // Wave choreo: flowing sequential, 8-beat loop
+  _waveChoreo(phase, beatIdx, snap, I, m, au) {
+    const p = phase * Math.PI * 2;
+    return {
+      Hips: { y: Math.sin(p)*0.3*m*I, posY: Math.sin(p*2)*0.06*I, x: Math.sin(p*0.5)*0.1*I },
+      Spine: { y: Math.sin(p+0.4)*0.25*m*I, x: Math.sin(p*0.5+0.3)*0.12*I },
+      UpperChest: { y: Math.sin(p+0.8)*0.2*m*I },
+      Chest: { y: Math.sin(p+0.6)*0.15*m*I },
+      Neck: { y: Math.sin(p+1.0)*0.15*m*I, x: Math.sin(p*0.5)*0.1*I },
+      Head: { y: Math.sin(p+1.2)*0.12*m*I, x: Math.sin(p*0.5+0.5)*0.08*I },
+      LeftUpperArm: { x: Math.sin(p)*0.4*I, z: 0.4+Math.sin(p+0.5)*0.9*I },
+      RightUpperArm: { x: Math.sin(p+Math.PI)*0.4*I, z: -0.4-Math.sin(p+0.5+Math.PI)*0.9*I },
+      LeftLowerArm: { z: 0.2+Math.max(0,Math.sin(p*2))*0.6*I },
+      RightLowerArm: { z: -0.2-Math.max(0,Math.sin(p*2+Math.PI))*0.6*I },
+      LeftHand: { x: Math.sin(p*2)*0.25*I, z: Math.sin(p)*0.2*I },
+      RightHand: { x: Math.sin(p*2+Math.PI)*0.25*I, z: -Math.sin(p)*0.2*I },
+      LeftUpperLeg: { x: Math.sin(p)*-0.2*I, z: Math.sin(p*0.5)*0.08*I },
+      RightUpperLeg: { x: Math.sin(p+Math.PI)*-0.2*I, z: -Math.sin(p*0.5)*0.08*I },
+      LeftLowerLeg: { x: Math.max(0,Math.sin(p))*0.3*I },
+      RightLowerLeg: { x: Math.max(0,Math.sin(p+Math.PI))*0.3*I },
+    };
+  }
+
+  _blendPoses(a, b, t) {
+    const result = {};
+    const allBones = new Set([...Object.keys(a), ...Object.keys(b)]);
+    for (const bn of allBones) {
+      const pa = a[bn] || {}, pb = b[bn] || {};
+      result[bn] = {
+        x: lerp(pa.x||0, pb.x||0, t), y: lerp(pa.y||0, pb.y||0, t),
+        z: lerp(pa.z||0, pb.z||0, t), posY: lerp(pa.posY||0, pb.posY||0, t),
+      };
+    }
+    return result;
   }
 }
 
@@ -1286,6 +1503,7 @@ try {
 const audio = new AudioSystem();
 const camSys = new CameraSystem(camera);
 const overlay = new OverlaySystem();
+const formationSys = new FormationSystem();
 const POOL_SIZE = 3;
 const dancerPool = Array.from({length: POOL_SIZE}, (_, i) => new DanceEngine(i * 100, 0));
 let activeDancers = [];
@@ -1314,6 +1532,7 @@ const worldPaletteMap = {
 };
 
 function switchWorld(time) {
+  if (formationSys.active) formationSys.forceEnd();
   currentWorldIdx = Math.floor(Math.random() * WORLD_TYPES.length);
   worldGen.build(WORLD_TYPES[currentWorldIdx]);
   const counts = [1, 2, 2, 2, 3];
@@ -1549,25 +1768,29 @@ function animate() {
   const time = clock.getElapsedTime();
 
   audio.update(time);
-  // Beat snap: ~25% chance per beat, pick a random active dancer
-  if (audio.beatDetected && activeDancers.length > 0 && Math.random() > 0.75) {
+  formationSys.tryTrigger(activeDancers, audio);
+  // Beat snap: ~25% chance per beat (suppressed during formation)
+  if (audio.beatDetected && activeDancers.length > 0 && Math.random() > 0.75 && !formationSys.active) {
     activeDancers[Math.floor(Math.random() * activeDancers.length)].triggerSnap();
   }
   dancerPool.forEach(d => d.update(dt, audio));
+  formationSys.update(dt, audio, overlay, camSys);
 
-  // Collision avoidance (all pairs of active visible dancers)
+  // Collision avoidance (skip during formation — positions are fixed)
   const visibleDancers = activeDancers.filter(d => d.scaleTarget > 0.5 && d.rootScene);
-  for (let i = 0; i < visibleDancers.length; i++) {
-    for (let j = i + 1; j < visibleDancers.length; j++) {
-      const a = visibleDancers[i], b = visibleDancers[j];
-      const dx = b.stageX - a.stageX, dz = b.stageZ - a.stageZ;
-      const dist = Math.sqrt(dx*dx + dz*dz);
-      if (dist < 1.5 && dist > 0.001) {
-        const push = (1.5 - dist) * 0.5, nx = dx/dist, nz = dz/dist;
-        a.stageX -= nx*push; a.stageZ -= nz*push;
-        b.stageX += nx*push; b.stageZ += nz*push;
-        a.rootScene.position.x = a.stageX; a.rootScene.position.z = a.stageZ;
-        b.rootScene.position.x = b.stageX; b.rootScene.position.z = b.stageZ;
+  if (!formationSys.active) {
+    for (let i = 0; i < visibleDancers.length; i++) {
+      for (let j = i + 1; j < visibleDancers.length; j++) {
+        const a = visibleDancers[i], b = visibleDancers[j];
+        const dx = b.stageX - a.stageX, dz = b.stageZ - a.stageZ;
+        const dist = Math.sqrt(dx*dx + dz*dz);
+        if (dist < 1.5 && dist > 0.001) {
+          const push = (1.5 - dist) * 0.5, nx = dx/dist, nz = dz/dist;
+          a.stageX -= nx*push; a.stageZ -= nz*push;
+          b.stageX += nx*push; b.stageZ += nz*push;
+          a.rootScene.position.x = a.stageX; a.rootScene.position.z = a.stageZ;
+          b.rootScene.position.x = b.stageX; b.rootScene.position.z = b.stageZ;
+        }
       }
     }
   }
