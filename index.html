@@ -1475,18 +1475,18 @@ class WorldGenerator {
   }
 
   _highway() {
-    // Elevated highway lanes
+    // Highway road surface at ground level
     for (let i = 0; i < 6; i++) {
       const m = this._add(new THREE.Mesh(new THREE.BoxGeometry(2, 0.15, 30),
         this._mat({ color: new THREE.Color(0.06,0.06,0.08), specular: 0x222233, shininess: 60 })));
-      m.position.set(-5+i*2, 0.3+Math.sin(i*0.8)*0.5, 0);
+      m.position.set(-5+i*2, -0.08, 0);
     }
     // Lane dividers (dashed white lines)
     for (let j = 0; j < 5; j++) {
       for (let k = -6; k < 7; k++) {
         const m = this._add(new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.02, 0.6),
           new THREE.MeshBasicMaterial({ color: 0xcccccc })));
-        m.position.set(-4+j*2, 0.4+Math.sin(j*0.8)*0.5, k*2.2);
+        m.position.set(-4+j*2, 0.01, k*2.2);
       }
     }
     // Guardrails
@@ -1494,7 +1494,7 @@ class WorldGenerator {
       for (let k = -7; k < 8; k++) {
         const m = this._add(new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.8, 0.06),
           this._mat({ color: new THREE.Color(0.1,0.1,0.12), shininess: 40 })));
-        m.position.set(side*6, 0.7, k*2);
+        m.position.set(side*6, 0.4, k*2);
       }
     }
     // Distant city glow
