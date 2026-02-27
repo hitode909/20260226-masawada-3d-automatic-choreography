@@ -440,10 +440,13 @@ class DanceEngine {
       const isSnapBone = this.snapTimer > 0 && this.snapPose && (boneName in this.snapPose);
       const rate = isSnapBone ? Math.min(1, dt * 40) : smoothRate;
 
-      s.x = lerp(s.x, tx, rate);
-      s.y = lerp(s.y, ty, rate);
-      s.z = lerp(s.z, tz, rate);
-      s.posY = lerp(s.posY, tposY, rate);
+      // Freeze: hold current pose (battle/relay waiting dancers)
+      if (!(this.formationOverride && this.formationOverride.freeze)) {
+        s.x = lerp(s.x, tx, rate);
+        s.y = lerp(s.y, ty, rate);
+        s.z = lerp(s.z, tz, rate);
+        s.posY = lerp(s.posY, tposY, rate);
+      }
 
       const bone = this.bones[boneName];
       bone.rotation.x += s.x;
@@ -691,11 +694,17 @@ const FORMATIONS = {
               mirror: [false,false], mirror3: [false,false,false], loopBeats: 8, choreo: 'wave',
               phaseOffsets3: [0, 0.33, 0.66] },
 };
+// Battle/relay positions (face each other)
+const BATTLE_POS = {
+  2: [{x:-1.8,z:0},{x:1.8,z:0}],
+  3: [{x:0,z:1.4},{x:-1.5,z:-0.7},{x:1.5,z:-0.7}],
+};
 
 class FormationSystem {
   constructor() {
     this.active = false;
     this.phase = 'idle';
+    this.mode = 'formation'; // 'formation' | 'relay' | 'battle'
     this.formationDef = null;
     this.timer = 0;
     this.totalDuration = 0;
@@ -705,6 +714,12 @@ class FormationSystem {
     this.syncTime = 0;
     this.loopPeriod = 0;
     this.dancerSlots = [];
+    // Battle/relay state
+    this.currentSoloist = 0;
+    this.turnTimer = 0;
+    this.turnDuration = 0;
+    this.roundCount = 0;
+    this.maxRounds = 2;
   }
 
   tryTrigger(dancers, audio) {
@@ -718,19 +733,42 @@ class FormationSystem {
     this.active = true;
     this.phase = 'gather';
     this.timer = 0;
-    const keys = Object.keys(FORMATIONS);
-    this.formationDef = FORMATIONS[keys[Math.floor(Math.random() * keys.length)]];
-    const n = dancers.length;
-    const positions = this.formationDef.positions[n];
-    const mirrors = n === 3 ? (this.formationDef.mirror3 || []) : (this.formationDef.mirror || []);
-    const offsets = this.formationDef['phaseOffsets' + n] || new Array(n).fill(0);
-    this.loopPeriod = this.formationDef.loopBeats * BEAT_PERIOD;
-    this.totalDuration = (3 + Math.floor(Math.random() * 3)) * this.loopPeriod;
     this.syncTime = 0;
-    this.dancerSlots = dancers.map((d, i) => ({
-      dancer: d, targetX: positions[i].x, targetZ: positions[i].z,
-      mirror: mirrors[i] || false, phaseOffset: offsets[i] || 0,
-    }));
+
+    // Mode selection: 50% formation, 25% relay, 25% battle
+    const r = Math.random();
+    this.mode = r < 0.5 ? 'formation' : (r < 0.75 ? 'relay' : 'battle');
+
+    const n = dancers.length;
+    if (this.mode === 'formation') {
+      const keys = Object.keys(FORMATIONS);
+      this.formationDef = FORMATIONS[keys[Math.floor(Math.random() * keys.length)]];
+      const positions = this.formationDef.positions[n];
+      const mirrors = n === 3 ? (this.formationDef.mirror3 || []) : (this.formationDef.mirror || []);
+      const offsets = this.formationDef['phaseOffsets' + n] || new Array(n).fill(0);
+      this.loopPeriod = this.formationDef.loopBeats * BEAT_PERIOD;
+      this.totalDuration = (3 + Math.floor(Math.random() * 3)) * this.loopPeriod;
+      this.dancerSlots = dancers.map((d, i) => ({
+        dancer: d, targetX: positions[i].x, targetZ: positions[i].z,
+        mirror: mirrors[i] || false, phaseOffset: offsets[i] || 0,
+      }));
+    } else {
+      // Relay / Battle: turn-based
+      const positions = BATTLE_POS[n];
+      this.loopPeriod = 4 * BEAT_PERIOD; // 4-beat turn
+      this.turnDuration = 4 * BEAT_PERIOD;
+      this.currentSoloist = 0;
+      this.turnTimer = 0;
+      this.roundCount = 0;
+      this.maxRounds = 2;
+      this.totalDuration = this.turnDuration * n * this.maxRounds;
+      // Pick a random choreo for relay (all dancers do the same)
+      this.formationDef = { loopBeats: 4, choreo: Math.random() > 0.5 ? 'sharp' : 'wave' };
+      this.dancerSlots = dancers.map((d, i) => ({
+        dancer: d, targetX: positions[i].x, targetZ: positions[i].z,
+        mirror: false, phaseOffset: 0,
+      }));
+    }
     this.dancerSlots.forEach(s => {
       s.dancer.formationOverride = { targetX: s.targetX, targetZ: s.targetZ, pose: null, blend: 0 };
     });
@@ -768,12 +806,42 @@ class FormationSystem {
       }
     } else if (this.phase === 'synced') {
       this.syncTime += dt;
-      this.dancerSlots.forEach(s => {
-        const offset = s.phaseOffset * this.loopPeriod;
-        const loopPhase = ((this.syncTime + offset) % this.loopPeriod) / this.loopPeriod;
-        const pose = this._getPose(loopPhase, audio, s.mirror);
-        s.dancer.formationOverride = { targetX: s.targetX, targetZ: s.targetZ, pose, blend: 1 };
-      });
+
+      if (this.mode === 'formation') {
+        // All dancers move together
+        this.dancerSlots.forEach(s => {
+          const offset = s.phaseOffset * this.loopPeriod;
+          const loopPhase = ((this.syncTime + offset) % this.loopPeriod) / this.loopPeriod;
+          const pose = this._getPose(loopPhase, audio, s.mirror);
+          s.dancer.formationOverride = { targetX: s.targetX, targetZ: s.targetZ, pose, blend: 1 };
+        });
+      } else {
+        // Relay / Battle: one dancer at a time, others rest
+        this.turnTimer += dt;
+        if (this.turnTimer >= this.turnDuration) {
+          this.turnTimer = 0;
+          this.currentSoloist = (this.currentSoloist + 1) % this.dancerSlots.length;
+          if (this.currentSoloist === 0) this.roundCount++;
+          overlay.triggerBeat(0.8);
+          camSys.focusDancer = this.currentSoloist;
+        }
+        this.dancerSlots.forEach((s, i) => {
+          if (i === this.currentSoloist) {
+            // Soloist: dance (relay=shared choreo, battle=own style)
+            if (this.mode === 'relay') {
+              const loopPhase = (this.turnTimer % this.loopPeriod) / this.loopPeriod;
+              const pose = this._getPose(loopPhase, audio, false);
+              s.dancer.formationOverride = { targetX: s.targetX, targetZ: s.targetZ, pose, blend: 1 };
+            } else {
+              // Battle: let dancer use own style (no pose override, just position)
+              s.dancer.formationOverride = { targetX: s.targetX, targetZ: s.targetZ, pose: null, blend: 0 };
+            }
+          } else {
+            // Waiting: freeze in current pose
+            s.dancer.formationOverride = { targetX: s.targetX, targetZ: s.targetZ, freeze: true };
+          }
+        });
+      }
       if (this.timer >= this.totalDuration) { this.phase = 'release'; this.timer = 0; }
     } else if (this.phase === 'release') {
       const blend = 1 - smoothstep(0, 1, Math.min(1, this.timer / this.releaseDuration));
@@ -873,7 +941,8 @@ class FormationSystem {
 // ============================================================
 // WORLD GENERATOR - Procedural stages
 // ============================================================
-const WORLD_TYPES = ['crystal','ruins','neon','organic','tower','void','sunset','underwater','aurora','disco','lava'];
+const WORLD_TYPES = ['crystal','ruins','neon','organic','tower','void','sunset','underwater','aurora','disco','lava',
+  'skyscraper','rocky','highway','factory','canyon','glacier','shrine','scaffold','desert','circuit'];
 const worldConfigs = {
   crystal:    { bgColor: 0x1a0055, fogColor: 0x100038, fogDensity: 0.035 },
   ruins:      { bgColor: 0x1a1210, fogColor: 0x0e0a08, fogDensity: 0.05  },
@@ -886,6 +955,16 @@ const worldConfigs = {
   aurora:     { bgColor: 0x0c2040, fogColor: 0x081830, fogDensity: 0.018 },
   disco:      { bgColor: 0x380068, fogColor: 0x280050, fogDensity: 0.04  },
   lava:       { bgColor: 0x580c00, fogColor: 0x3e0800, fogDensity: 0.045 },
+  skyscraper: { bgColor: 0x0a0e1a, fogColor: 0x060a14, fogDensity: 0.03  },
+  rocky:      { bgColor: 0x1a1510, fogColor: 0x110e0a, fogDensity: 0.04  },
+  highway:    { bgColor: 0x0c0c14, fogColor: 0x08080e, fogDensity: 0.025 },
+  factory:    { bgColor: 0x141210, fogColor: 0x0e0c0a, fogDensity: 0.05  },
+  canyon:     { bgColor: 0x3a1808, fogColor: 0x2a1206, fogDensity: 0.035 },
+  glacier:    { bgColor: 0x0e2030, fogColor: 0x0a1825, fogDensity: 0.02  },
+  shrine:     { bgColor: 0x180a08, fogColor: 0x100806, fogDensity: 0.04  },
+  scaffold:   { bgColor: 0x101418, fogColor: 0x0a0e12, fogDensity: 0.035 },
+  desert:     { bgColor: 0x4a3018, fogColor: 0x382410, fogDensity: 0.025 },
+  circuit:    { bgColor: 0x040818, fogColor: 0x030610, fogDensity: 0.02  },
 };
 
 class WorldGenerator {
@@ -1202,6 +1281,265 @@ class WorldGenerator {
       m.position.set((Math.random() - 0.5) * 12, Math.random() * 4, (Math.random() - 0.5) * 12);
       m.userData.baseY = m.position.y;
       m.userData.floatSpeed = 0.8 + Math.random() * 1.2; m.userData.floatOffset = Math.random() * Math.PI * 2;
+    }
+  }
+
+  _skyscraper() {
+    // Dense high-rise cityscape
+    for (let i = 0; i < 30; i++) {
+      const w = 0.4 + Math.random() * 1.5, h = 3 + Math.random() * 12, d = 0.4 + Math.random() * 1.5;
+      const g = 0.03 + Math.random() * 0.08;
+      const m = this._add(new THREE.Mesh(new THREE.BoxGeometry(w, h, d),
+        this._mat({ color: new THREE.Color(g, g, g*1.2), specular: 0x1a1a2e, shininess: 80 })));
+      const r = 3 + Math.random() * 10, a = Math.random() * Math.PI * 2;
+      m.position.set(Math.cos(a)*r, h/2, Math.sin(a)*r);
+    }
+    // Window lights
+    for (let i = 0; i < 50; i++) {
+      const warm = Math.random() > 0.3;
+      const m = this._add(new THREE.Mesh(new THREE.PlaneGeometry(0.1, 0.06),
+        new THREE.MeshBasicMaterial({ color: new THREE.Color().setHSL(warm?0.12:0.6, 0.8, 0.85), transparent:true, opacity:0.7 })));
+      const r = 3.5+Math.random()*9, a = Math.random()*Math.PI*2;
+      m.position.set(Math.cos(a)*r, 0.5+Math.random()*10, Math.sin(a)*r);
+      m.rotation.y = a + Math.PI/2;
+    }
+  }
+
+  _rocky() {
+    // Jagged rock formations (randomized icosahedrons)
+    for (let i = 0; i < 20; i++) {
+      const s = 0.5 + Math.random() * 2.5, det = Math.floor(Math.random()*2);
+      const g = 0.06 + Math.random() * 0.1;
+      const m = this._add(new THREE.Mesh(new THREE.IcosahedronGeometry(s, det),
+        this._mat({ color: new THREE.Color(g, g*0.9, g*0.7), specular: 0x222211, shininess: 20 })));
+      const r = 2+Math.random()*8, a = Math.random()*Math.PI*2;
+      m.position.set(Math.cos(a)*r, s*0.4+Math.random()*0.5, Math.sin(a)*r);
+      m.rotation.set(Math.random()*0.5, Math.random()*Math.PI*2, Math.random()*0.3);
+    }
+    // Scattered small stones
+    for (let i = 0; i < 16; i++) {
+      const s = 0.08+Math.random()*0.25;
+      const m = this._add(new THREE.Mesh(new THREE.DodecahedronGeometry(s, 0),
+        this._mat({ color: new THREE.Color(0.08,0.07,0.05), shininess: 10 })));
+      m.position.set((Math.random()-0.5)*12, s*0.3, (Math.random()-0.5)*12);
+    }
+  }
+
+  _highway() {
+    // Elevated highway lanes
+    for (let i = 0; i < 6; i++) {
+      const m = this._add(new THREE.Mesh(new THREE.BoxGeometry(2, 0.15, 30),
+        this._mat({ color: new THREE.Color(0.06,0.06,0.08), specular: 0x222233, shininess: 60 })));
+      m.position.set(-5+i*2, 0.3+Math.sin(i*0.8)*0.5, 0);
+    }
+    // Lane dividers (dashed white lines)
+    for (let j = 0; j < 5; j++) {
+      for (let k = -6; k < 7; k++) {
+        const m = this._add(new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.02, 0.6),
+          new THREE.MeshBasicMaterial({ color: 0xcccccc })));
+        m.position.set(-4+j*2, 0.4+Math.sin(j*0.8)*0.5, k*2.2);
+      }
+    }
+    // Guardrails
+    for (let side = -1; side <= 1; side += 2) {
+      for (let k = -7; k < 8; k++) {
+        const m = this._add(new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.8, 0.06),
+          this._mat({ color: new THREE.Color(0.1,0.1,0.12), shininess: 40 })));
+        m.position.set(side*6, 0.7, k*2);
+      }
+    }
+    // Distant city glow
+    for (let i = 0; i < 12; i++) {
+      const h = 2+Math.random()*8;
+      const m = this._add(new THREE.Mesh(new THREE.BoxGeometry(0.6+Math.random(), h, 0.6+Math.random()),
+        this._mat({ color: new THREE.Color(0.03,0.03,0.05), emissive: new THREE.Color(0.01,0.01,0.03) })));
+      m.position.set((Math.random()-0.5)*20, h/2, -12-Math.random()*5);
+    }
+  }
+
+  _factory() {
+    // Industrial pipes and tanks
+    for (let i = 0; i < 10; i++) {
+      const h = 2+Math.random()*6, rad = 0.15+Math.random()*0.4;
+      const m = this._add(new THREE.Mesh(new THREE.CylinderGeometry(rad, rad, h, 8),
+        this._mat({ color: new THREE.Color(0.08,0.07,0.06), specular: 0x333322, shininess: 40 })));
+      const r = 2+Math.random()*7, a = Math.random()*Math.PI*2;
+      m.position.set(Math.cos(a)*r, h/2, Math.sin(a)*r);
+    }
+    // Horizontal cross-pipes
+    for (let i = 0; i < 8; i++) {
+      const len = 2+Math.random()*5;
+      const m = this._add(new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, len, 6),
+        this._mat({ color: new THREE.Color(0.1,0.08,0.06), shininess: 30 })));
+      m.position.set((Math.random()-0.5)*10, 1+Math.random()*4, (Math.random()-0.5)*10);
+      m.rotation.z = Math.PI/2 + (Math.random()-0.5)*0.3;
+      m.rotation.y = Math.random()*Math.PI;
+    }
+    // Warning lights
+    for (let i = 0; i < 6; i++) {
+      const m = this._add(new THREE.Mesh(new THREE.SphereGeometry(0.08, 6, 6),
+        new THREE.MeshBasicMaterial({ color: new THREE.Color().setHSL(Math.random()>0.5?0.0:0.12, 1, 0.7) })));
+      const r = 3+Math.random()*6, a = Math.random()*Math.PI*2;
+      m.position.set(Math.cos(a)*r, 2+Math.random()*4, Math.sin(a)*r);
+      m.userData.baseY = m.position.y; m.userData.floatSpeed = 0.3; m.userData.floatOffset = Math.random()*Math.PI*2;
+    }
+  }
+
+  _canyon() {
+    // Tall canyon walls on both sides
+    for (let side = -1; side <= 1; side += 2) {
+      for (let i = 0; i < 8; i++) {
+        const w = 1+Math.random()*3, h = 4+Math.random()*8, d = 1+Math.random()*4;
+        const g = 0.08+Math.random()*0.06;
+        const m = this._add(new THREE.Mesh(new THREE.BoxGeometry(w, h, d),
+          this._mat({ color: new THREE.Color(g, g*0.7, g*0.4), specular: 0x221108, shininess: 15 })));
+        m.position.set(side*(3+Math.random()*2), h/2, (Math.random()-0.5)*14);
+        m.rotation.y = (Math.random()-0.5)*0.3;
+      }
+    }
+    // Fallen boulders
+    for (let i = 0; i < 10; i++) {
+      const s = 0.2+Math.random()*0.8;
+      const m = this._add(new THREE.Mesh(new THREE.DodecahedronGeometry(s, 0),
+        this._mat({ color: new THREE.Color(0.1, 0.07, 0.04), shininess: 10 })));
+      m.position.set((Math.random()-0.5)*5, s*0.4, (Math.random()-0.5)*10);
+      m.rotation.set(Math.random(), Math.random(), Math.random());
+    }
+  }
+
+  _glacier() {
+    // Large ice blocks
+    for (let i = 0; i < 16; i++) {
+      const w = 0.5+Math.random()*2.5, h = 0.5+Math.random()*4, d = 0.5+Math.random()*2.5;
+      const hue = 0.52+Math.random()*0.08;
+      const m = this._add(new THREE.Mesh(new THREE.BoxGeometry(w, h, d),
+        this._mat({ color: new THREE.Color().setHSL(hue, 0.3, 0.2),
+          specular: new THREE.Color().setHSL(hue, 0.8, 0.7), shininess: 200, opacity: 0.75 })));
+      const r = 2+Math.random()*8, a = Math.random()*Math.PI*2;
+      m.position.set(Math.cos(a)*r, h/2, Math.sin(a)*r);
+      m.rotation.y = Math.random()*0.4;
+    }
+    // Ice spikes
+    for (let i = 0; i < 12; i++) {
+      const h = 1+Math.random()*3;
+      const m = this._add(new THREE.Mesh(new THREE.ConeGeometry(0.08+Math.random()*0.15, h, 4),
+        this._mat({ color: new THREE.Color().setHSL(0.55, 0.4, 0.25),
+          specular: new THREE.Color(0.8,0.9,1), shininess: 250 })));
+      const r = 1.5+Math.random()*7, a = Math.random()*Math.PI*2;
+      m.position.set(Math.cos(a)*r, h/2, Math.sin(a)*r);
+    }
+  }
+
+  _shrine() {
+    // Torii-like gate pillars
+    for (let i = 0; i < 5; i++) {
+      const z = -4+i*2;
+      for (let side = -1; side <= 1; side += 2) {
+        const m = this._add(new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.15, 4, 6),
+          this._mat({ color: new THREE.Color(0.3, 0.05, 0.02), specular: 0x331108, shininess: 30 })));
+        m.position.set(side*1.5, 2, z);
+      }
+      // Cross beam
+      const beam = this._add(new THREE.Mesh(new THREE.BoxGeometry(3.5, 0.15, 0.12),
+        this._mat({ color: new THREE.Color(0.3, 0.05, 0.02), shininess: 30 })));
+      beam.position.set(0, 3.8, z);
+    }
+    // Stone lanterns
+    for (let i = 0; i < 6; i++) {
+      const m = this._add(new THREE.Mesh(new THREE.BoxGeometry(0.25, 0.5, 0.25),
+        this._mat({ color: new THREE.Color(0.12,0.11,0.1), shininess: 20 })));
+      const r = 2.5+Math.random()*4, a = Math.random()*Math.PI*2;
+      m.position.set(Math.cos(a)*r, 0.25, Math.sin(a)*r);
+      // Lantern light
+      const light = this._add(new THREE.Mesh(new THREE.SphereGeometry(0.06, 6, 6),
+        new THREE.MeshBasicMaterial({ color: new THREE.Color().setHSL(0.08, 1, 0.75) })));
+      light.position.set(Math.cos(a)*r, 0.55, Math.sin(a)*r);
+    }
+  }
+
+  _scaffold() {
+    // Metal scaffolding grid
+    for (let x = -3; x <= 3; x += 2) {
+      for (let z = -3; z <= 3; z += 2) {
+        // Vertical poles
+        const h = 3+Math.random()*5;
+        const m = this._add(new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, h, 4),
+          this._mat({ color: new THREE.Color(0.12,0.12,0.14), shininess: 60 })));
+        m.position.set(x+Math.random()*0.5, h/2, z+Math.random()*0.5);
+      }
+    }
+    // Horizontal beams
+    for (let level = 1; level < 4; level++) {
+      for (let i = 0; i < 8; i++) {
+        const len = 1.5+Math.random()*3;
+        const m = this._add(new THREE.Mesh(new THREE.BoxGeometry(len, 0.04, 0.04),
+          this._mat({ color: new THREE.Color(0.1,0.1,0.12), shininess: 50 })));
+        m.position.set((Math.random()-0.5)*6, level*2, (Math.random()-0.5)*6);
+        m.rotation.y = Math.random()*Math.PI;
+      }
+    }
+    // Plywood platforms
+    for (let i = 0; i < 6; i++) {
+      const m = this._add(new THREE.Mesh(new THREE.BoxGeometry(1.8+Math.random(), 0.05, 1.8+Math.random()),
+        this._mat({ color: new THREE.Color(0.12, 0.1, 0.06), shininess: 10 })));
+      m.position.set((Math.random()-0.5)*5, 1+Math.floor(Math.random()*3)*2, (Math.random()-0.5)*5);
+    }
+  }
+
+  _desert() {
+    // Sand dunes (stretched, tilted boxes)
+    for (let i = 0; i < 10; i++) {
+      const w = 2+Math.random()*5, d = 2+Math.random()*5;
+      const m = this._add(new THREE.Mesh(new THREE.BoxGeometry(w, 0.3+Math.random()*0.5, d),
+        this._mat({ color: new THREE.Color(0.22, 0.18, 0.1), specular: 0x332211, shininess: 15 })));
+      const r = 2+Math.random()*8, a = Math.random()*Math.PI*2;
+      m.position.set(Math.cos(a)*r, 0.15, Math.sin(a)*r);
+      m.rotation.y = Math.random()*Math.PI; m.rotation.z = (Math.random()-0.5)*0.15;
+    }
+    // Dead tree trunks
+    for (let i = 0; i < 5; i++) {
+      const h = 1.5+Math.random()*3;
+      const m = this._add(new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.08, h, 5),
+        this._mat({ color: new THREE.Color(0.08, 0.06, 0.04), shininess: 5 })));
+      const r = 3+Math.random()*6, a = Math.random()*Math.PI*2;
+      m.position.set(Math.cos(a)*r, h/2, Math.sin(a)*r);
+      m.rotation.z = (Math.random()-0.5)*0.4;
+    }
+    // Heat shimmer orbs
+    for (let i = 0; i < 8; i++) {
+      const m = this._add(new THREE.Mesh(new THREE.SphereGeometry(0.15+Math.random()*0.3, 6, 6),
+        new THREE.MeshBasicMaterial({ color: new THREE.Color().setHSL(0.1, 0.8, 0.7), transparent:true, opacity:0.2 })));
+      m.position.set((Math.random()-0.5)*14, 0.5+Math.random()*2, (Math.random()-0.5)*14);
+      m.userData.baseY = m.position.y; m.userData.floatSpeed = 0.4+Math.random()*0.3; m.userData.floatOffset = Math.random()*Math.PI*2;
+    }
+  }
+
+  _circuit() {
+    // Circuit board traces (thin bright lines on ground)
+    for (let i = 0; i < 25; i++) {
+      const hue = 0.3+Math.random()*0.4;
+      const len = 1+Math.random()*6;
+      const m = this._add(new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.01, len),
+        new THREE.MeshBasicMaterial({ color: new THREE.Color().setHSL(hue, 1, 0.6), transparent:true, opacity:0.85 })));
+      m.position.set((Math.random()-0.5)*12, 0.01, (Math.random()-0.5)*12);
+      m.rotation.y = Math.floor(Math.random()*4)*Math.PI/2; // orthogonal only
+    }
+    // Chip-like blocks
+    for (let i = 0; i < 14; i++) {
+      const w = 0.3+Math.random()*0.8, d = 0.3+Math.random()*0.8, h = 0.1+Math.random()*0.3;
+      const m = this._add(new THREE.Mesh(new THREE.BoxGeometry(w, h, d),
+        this._mat({ color: new THREE.Color(0.04, 0.06, 0.04), specular: 0x113311, shininess: 80 })));
+      const r = 1.5+Math.random()*7, a = Math.random()*Math.PI*2;
+      m.position.set(Math.cos(a)*r, h/2, Math.sin(a)*r);
+      m.rotation.y = Math.floor(Math.random()*4)*Math.PI/2;
+    }
+    // Data pulse lights
+    for (let i = 0; i < 10; i++) {
+      const hue = 0.35+Math.random()*0.3;
+      const m = this._add(new THREE.Mesh(new THREE.SphereGeometry(0.05, 5, 5),
+        new THREE.MeshBasicMaterial({ color: new THREE.Color().setHSL(hue, 1, 0.8) })));
+      m.position.set((Math.random()-0.5)*10, 0.03, (Math.random()-0.5)*10);
+      m.userData.baseY = 0.03; m.userData.floatSpeed = 1+Math.random()*2; m.userData.floatOffset = Math.random()*Math.PI*2;
     }
   }
 
@@ -1529,6 +1867,8 @@ function setActiveDancers(count) {
 const worldPaletteMap = {
   crystal: 2, ruins: 0, neon: 3, organic: 4, tower: 3,
   void: 2, sunset: 1, underwater: 2, aurora: 2, disco: 0, lava: 1,
+  skyscraper: 2, rocky: 0, highway: 3, factory: 0, canyon: 1,
+  glacier: 2, shrine: 1, scaffold: 3, desert: 1, circuit: 4,
 };
 
 function switchWorld(time) {
